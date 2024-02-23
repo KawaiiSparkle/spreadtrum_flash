@@ -17,6 +17,7 @@
 #include "common.h"
 #define REOPEN_FREQ 2
 
+extern DA_INFO_T Da_Info;
 int main(int argc, char **argv) {
 	spdio_t *io = NULL; int ret, i;
 	int wait = 30 * REOPEN_FREQ;
@@ -104,16 +105,21 @@ int main(int argc, char **argv) {
 		break;
 	case 2:
 		io->flags &= ~FLAGS_CRC16;
-#if AUTO_DISABLE_TRANSCODE
-		io->flags &= ~FLAGS_TRANSCODE;
-#endif
+		encode_msg(io, BSL_CMD_DISABLE_TRANSCODE, NULL, 0);
+		send_msg(io);
+		ret = recv_msg(io);
+		if (!ret) ERR_EXIT("timeout reached\n");
+		if (recv_type(io) == BSL_REP_ACK) {
+			io->flags &= ~FLAGS_TRANSCODE;
+			DBG_LOG("DISABLE_TRANSCODE\n");
+		}
 		fdl1_loaded = 1;
 		fdl2_loaded = 1;
 		break;
 	default:
 		encode_msg(io, BSL_CMD_CHECK_BAUD, NULL, 1);
 		send_msg(io);
-		ret = recv_msg(io);
+		recv_msg(io);
 		if (recv_type(io) != BSL_REP_VER)
 			ERR_EXIT("wrong command or wrong mode detected, reboot your phone by pressing POWER and VOL_UP for 7-10 seconds.\n");
 		DBG_LOG("CHECK_BAUD bootrom\n");
@@ -220,7 +226,7 @@ int main(int argc, char **argv) {
 				i = 0;
 				while (1) {
 					send_msg(io);
-					ret = recv_msg(io);
+					recv_msg(io);
 					if (recv_type(io) == BSL_REP_VER) break;
 					DBG_LOG("CHECK_BAUD FAIL\n");
 					i++;
@@ -243,6 +249,7 @@ int main(int argc, char **argv) {
 				while (1) {
 					send_msg(io);
 					ret = recv_msg(io);
+					if (!ret) ERR_EXIT("timeout reached\n");
 					if (recv_type(io) == BSL_CMD_READ_END) break;
 					pdump = (char*)(io->raw_buf + 4);
 					for (i = 0; i < 512; i++)
@@ -287,16 +294,21 @@ int main(int argc, char **argv) {
 				ret = recv_type(io);
 				// Is it always bullshit?
 				if (ret == BSL_REP_INCOMPATIBLE_PARTITION)
-					DBG_LOG("FDL2: incompatible partition\n");
+					get_Da_Info(io);
 				else if (ret != BSL_REP_ACK)
 					ERR_EXIT("unexpected response (0x%04x)\n", ret);
 				DBG_LOG("EXEC FDL2\n");
-#if AUTO_DISABLE_TRANSCODE
-				encode_msg(io, BSL_CMD_DISABLE_TRANSCODE, NULL, 0);
-				send_and_check(io);
-				io->flags &= ~FLAGS_TRANSCODE;
-				DBG_LOG("DISABLE_TRANSCODE\n");
-#endif
+				if (Da_Info.bDisableHDLC) {
+					encode_msg(io, BSL_CMD_DISABLE_TRANSCODE, NULL, 0);
+					send_and_check(io);
+					io->flags &= ~FLAGS_TRANSCODE;
+					DBG_LOG("DISABLE_TRANSCODE\n");
+				}
+				if (Da_Info.bSupportRawData == 2) {
+					encode_msg(io, BSL_CMD_WRITE_RAW_DATA_ENABLE, NULL, 0);
+					send_and_check(io);
+					DBG_LOG("ENABLE_WRITE_RAW_DATA\n");
+				}
 				if (nand_id == DEFAULT_NAND_ID) {
 					nand_info[0] = (uint8_t)pow(2, nand_id & 3); //page size
 					nand_info[1] = 32 / (uint8_t)pow(2, (nand_id >> 2) & 3); //spare area size
@@ -369,7 +381,16 @@ int main(int argc, char **argv) {
 			if (offset + size < offset)
 				{ DBG_LOG("64-bit limit reached\n");continue; }
 			dump_partition(io, name, offset, size, fn,
-					blk_size ? blk_size : 0xffff);
+					blk_size ? blk_size : 0x3000);
+
+		} else if (!strcmp(str2[1], "read_parts")) {
+			const char* fn; FILE* fi;
+			if (argcount <= 2) { DBG_LOG("read_parts partition_list_file\n\t(ufs/emmc) read_parts part.xml\n\t(ubi) read_parts ubipart.xml\n"); continue; }
+			fn = str2[2];
+			fi = fopen(fn, "r");
+			if (fi == NULL) { DBG_LOG("File does not exist.\n"); continue; }
+			else fclose(fi);
+			dump_partitions(io, nand_info, fn);
 
 		} else if (!strcmp(str2[1], "partition_list")) {
 			if (argcount <= 2) { DBG_LOG("partition_list FILE\n");continue; }
@@ -398,7 +419,7 @@ int main(int argc, char **argv) {
 			if (strstr(str2[2], "fixnv") || strstr(str2[2], "runtimenv"))
 				load_nv_partition(io, str2[2], str2[3], blk_size ? blk_size : 4096);
 			else
-				load_partition(io, str2[2], str2[3], blk_size ? blk_size : 4096);
+				load_partition(io, str2[2], str2[3], blk_size ? blk_size : 0xf000);
 
 		} else if (!strcmp(str2[1], "read_pactime")) {
 			read_pactime(io);
@@ -413,6 +434,7 @@ int main(int argc, char **argv) {
 			encode_msg(io, BSL_CMD_READ_CHIP_UID, NULL, 0);
 			send_msg(io);
 			ret = recv_msg(io);
+			if (!ret) ERR_EXIT("timeout reached\n");
 			if ((ret = recv_type(io)) != BSL_REP_READ_CHIP_UID)
 				{ DBG_LOG("unexpected response (0x%04x)\n", ret);continue; }
 
@@ -472,6 +494,7 @@ int main(int argc, char **argv) {
 			DBG_LOG("exec\n");
 			DBG_LOG("read_part part_name offset size FILE\n");
 			DBG_LOG("(read ubi on nand) read_part system 0 ubi40m system.bin\n");
+			DBG_LOG("read_parts partition_list_file\n\t(ufs/emmc) read_parts part.xml\n\t(ubi) read_parts ubipart.xml\n");
 			DBG_LOG("write_part part_name FILE\n");
 			DBG_LOG("erase_part part_name\n");
 			DBG_LOG("partition_list FILE\n");

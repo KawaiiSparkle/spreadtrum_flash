@@ -91,6 +91,17 @@ typedef struct {
 	int raw_len, enc_len, verbose, timeout;
 } spdio_t;
 
+typedef struct {
+	uint32_t   dwVersion;
+	uint32_t   bDisableHDLC;	//0: Enable hdl; 1:Disable hdl
+	uint8_t    bIsOldMemory;
+	uint8_t    bSupportRawData;
+	uint8_t    bReserve[2];
+	uint32_t   dwFlushSize;		//unit KB
+	uint32_t   dwStorageType;
+	uint32_t   dwReserve[59];	//Reserve
+}DA_INFO_T;
+
 void print_string(FILE* f, const void* src, size_t n);
 
 #if USE_LIBUSB
@@ -111,6 +122,7 @@ void send_file(spdio_t *io, const char *fn, uint32_t start_addr, int end_data, u
 unsigned dump_flash(spdio_t *io, uint32_t addr, uint32_t start, uint32_t len, const char *fn, unsigned step);
 unsigned dump_mem(spdio_t *io, uint32_t start, uint32_t len, const char *fn, unsigned step);
 uint64_t dump_partition(spdio_t *io, const char *name, uint64_t start, uint64_t len, const char *fn, unsigned step);
+void dump_partitions(spdio_t* io, int* nand_info, const char* fn);
 uint64_t read_pactime(spdio_t *io);
 void partition_list(spdio_t *io, const char *fn);
 void repartition(spdio_t *io, const char *fn);
@@ -120,3 +132,4 @@ void load_nv_partition(spdio_t* io, const char* name, const char* fn, unsigned s
 int64_t find_partition_size(spdio_t *io, const char *name);
 uint64_t str_to_size(const char *str);
 uint64_t str_to_size_ubi(const char* str, int* nand_info);
+void get_Da_Info(spdio_t* io);

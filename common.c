@@ -154,6 +154,8 @@ void find_endpoints(libusb_device_handle* dev_handle, int result[2]) {
 
 #define RECV_BUF_LEN (0x8000)
 
+DA_INFO_T Da_Info;
+
 spdio_t* spdio_init(int flags) {
 	uint8_t* p; spdio_t* io;
 
@@ -319,6 +321,7 @@ int recv_msg(spdio_t* io) {
 
 	len = io->recv_len;
 	pos = io->recv_pos;
+	memset(io->recv_buf, 0, 8);
 	for (;;) {
 		if (pos >= len) {
 #if USE_LIBUSB
@@ -518,6 +521,7 @@ unsigned dump_flash(spdio_t* io,
 		encode_msg(io, BSL_CMD_READ_FLASH, data, 4 * 3);
 		send_msg(io);
 		ret = recv_msg(io);
+		if (!ret) ERR_EXIT("timeout reached\n");
 		if ((ret = recv_type(io)) != BSL_REP_READ_FLASH) {
 			DBG_LOG("unexpected response (0x%04x)\n", ret);
 			break;
@@ -554,6 +558,7 @@ unsigned dump_mem(spdio_t* io,
 		encode_msg(io, BSL_CMD_READ_FLASH, data, sizeof(data));
 		send_msg(io);
 		ret = recv_msg(io);
+		if (!ret) ERR_EXIT("timeout reached\n");
 		if ((ret = recv_type(io)) != BSL_REP_READ_FLASH) {
 			DBG_LOG("unexpected response (0x%04x)\n", ret);
 			break;
@@ -650,6 +655,7 @@ uint64_t dump_partition(spdio_t* io,
 		encode_msg(io, BSL_CMD_READ_MIDST, data, mode64 ? 12 : 8);
 		send_msg(io);
 		ret = recv_msg(io);
+		if (!ret) ERR_EXIT("timeout reached\n");
 		if ((ret = recv_type(io)) != BSL_REP_READ_FLASH) {
 			DBG_LOG("unexpected response (0x%04x)\n", ret);
 			break;
@@ -685,7 +691,8 @@ uint64_t read_pactime(spdio_t* io) {
 	WRITE32_LE(data + 1, offset);
 	encode_msg(io, BSL_CMD_READ_MIDST, data, sizeof(data));
 	send_msg(io);
-	recv_msg(io);
+	ret = recv_msg(io);
+	if (!ret) ERR_EXIT("timeout reached\n");
 	if ((ret = recv_type(io)) != BSL_REP_READ_FLASH)
 		ERR_EXIT("unexpected response (0x%04x)\n", ret);
 	n = READ16_BE(io->raw_buf + 2);
@@ -767,7 +774,8 @@ void partition_list(spdio_t* io, const char* fn) {
 
 	encode_msg(io, BSL_CMD_READ_PARTITION, NULL, 0);
 	send_msg(io);
-	recv_msg(io);
+	ret = recv_msg(io);
+	if (!ret) ERR_EXIT("timeout reached\n");
 	ret = recv_type(io);
 	if (ret != BSL_REP_READ_PARTITION)
 		ERR_EXIT("unexpected response (0x%04x)\n", ret);
@@ -839,19 +847,52 @@ void load_partition(spdio_t* io, const char* name,
 	select_partition(io, name, len, mode64, BSL_CMD_START_DATA);
 	send_and_check(io);
 
-	for (offset = 0; (n64 = len - offset); offset += n) {
-		n = n64 > step ? step : n64;
-		if (fread(io->temp_buf, 1, n, fi) != n)
-			ERR_EXIT("fread(load) failed\n");
-		encode_msg(io, BSL_CMD_MIDST_DATA, io->temp_buf, n);
-		send_msg(io);
-		ret = recv_msg_timeout(io, 15000);
-		if (!ret) ERR_EXIT("timeout reached\n");
-		if ((ret = recv_type(io)) != BSL_REP_ACK) {
-			DBG_LOG("unexpected response (0x%04x)\n", ret);
-			break;
+	if (Da_Info.bSupportRawData == 2) {
+		step = Da_Info.dwFlushSize << 10;
+		uint8_t* rawbuf = (uint8_t*)malloc(step);
+		if (!rawbuf) ERR_EXIT("malloc failed\n");
+		encode_msg(io, BSL_CMD_DLOAD_RAW_START2, NULL, 0);
+		send_and_check(io);
+
+		for (offset = 0; (n64 = len - offset); offset += n) {
+			n = n64 > step ? step : n64;
+			if (fread(rawbuf, 1, n, fi) != n)
+				ERR_EXIT("fread(load) failed\n");
+#if USE_LIBUSB
+			int err = libusb_bulk_transfer(io->dev_handle,
+				io->endp_out, rawbuf, n, &ret, io->timeout);
+			if (err < 0)
+				ERR_EXIT("usb_send failed : %s\n", libusb_error_name(err));
+#else
+			ret = call_Write(io->handle, rawbuf, n);
+#endif
+			if (io->verbose >= 1) DBG_LOG("send (%d)\n", n);
+			if (ret != (int)n)
+				ERR_EXIT("usb_send failed (%d / %d)\n", ret, n);
+			ret = recv_msg_timeout(io, 15000);
+			if (!ret) ERR_EXIT("timeout reached\n");
+			if ((ret = recv_type(io)) != BSL_REP_ACK) {
+				DBG_LOG("unexpected response (0x%04x)\n", ret);
+				break;
+			}
+			print_progress_bar(len, offset, offset + n);
 		}
-		print_progress_bar(len, offset, offset + n);
+	}
+	else {
+		for (offset = 0; (n64 = len - offset); offset += n) {
+			n = n64 > step ? step : n64;
+			if (fread(io->temp_buf, 1, n, fi) != n)
+				ERR_EXIT("fread(load) failed\n");
+			encode_msg(io, BSL_CMD_MIDST_DATA, io->temp_buf, n);
+			send_msg(io);
+			ret = recv_msg_timeout(io, 15000);
+			if (!ret) ERR_EXIT("timeout reached\n");
+			if ((ret = recv_type(io)) != BSL_REP_ACK) {
+				DBG_LOG("unexpected response (0x%04x)\n", ret);
+				break;
+			}
+			print_progress_bar(len, offset, offset + n);
+		}
 	}
 	DBG_LOG("load_partition: %s, target: 0x%llx, written: 0x%llx\n",
 		name, (long long)len, (long long)offset);
@@ -929,10 +970,9 @@ void load_nv_partition(spdio_t* io, const char* name,
 			tmp[0] = 0;
 			tmp[1] = 0;
 			memcpy(tmp, mem + memOffset + len, sizeof(tmp));
-			uint16_t itemSize = tmp[1];
 
 			len += sizeof(tmp);
-			len += sizeof(char) * itemSize;
+			len += tmp[1];
 
 			uint32_t doffset = ((len + 3) & 0xFFFFFFFC) - len;
 			len += doffset;
@@ -1008,7 +1048,8 @@ int64_t find_partition_size(spdio_t* io, const char* name) {
 
 		encode_msg(io, BSL_CMD_READ_MIDST, data, sizeof(data));
 		send_msg(io);
-		recv_msg(io);
+		ret = recv_msg(io);
+		if (!ret) ERR_EXIT("timeout reached\n");
 		ret = recv_type(io);
 		if (ret != BSL_REP_READ_FLASH) continue;
 		offset = n64 + (1 << 20);
@@ -1059,4 +1100,116 @@ uint64_t str_to_size_ubi(const char* str, int* nand_info) {
 		}
 		else return n;
 	}
+}
+
+typedef struct {
+	char name[36];
+	long long size;
+} partition_t;
+
+void dump_partitions(spdio_t* io, int* nand_info, const char* fn) {
+	partition_t partitions[128];
+	const char* part1 = "Partitions>";
+	char* src, * p;
+	int part1_len = strlen(part1), found = 0, stage = 0, ubi = 0;
+	size_t size = 0;
+
+	if (!memcmp(fn, "ubi", 3)) ubi = 1;
+	src = (char*)loadfile(fn, &size, 1);
+	if (!src) ERR_EXIT("loadfile failed\n");
+	src[size] = 0;
+	p = src;
+
+	for (;;) {
+		int i, a = *p++, n;
+		char c;
+
+		if (a == ' ' || a == '\t' || a == '\n' || a == '\r') continue;
+
+		if (a != '<') {
+			if (!a) break;
+			if (stage != 1) continue;
+			ERR_EXIT("xml: unexpected symbol\n");
+		}
+
+		if (!memcmp(p, "!--", 3)) {
+			p = strstr(p + 3, "--");
+			if (!p || !((p[-1] - '!') | (p[-2] - '<')) || p[2] != '>')
+				ERR_EXIT("xml: unexpected syntax\n");
+			p += 3;
+			continue;
+		}
+
+		if (stage != 1) {
+			stage += !memcmp(p, part1, part1_len);
+			if (stage > 2)
+				ERR_EXIT("xml: more than one partition lists\n");
+			p = strchr(p, '>');
+			if (!p) ERR_EXIT("xml: unexpected syntax\n");
+			p++;
+			continue;
+		}
+
+		if (*p == '/' && !memcmp(p + 1, part1, part1_len)) {
+			p = p + 1 + part1_len;
+			stage++;
+			continue;
+		}
+
+		i = sscanf(p, "Partition id=\"%35[^\"]\" size=\"%lli\"/%n%c", partitions[found].name, &partitions[found].size, &n, &c);
+		if (i != 3 || c != '>')
+			ERR_EXIT("xml: unexpected syntax\n");
+		p += n + 1;
+		found++;
+		if (found >= 128) break;
+	}
+	if (p - 1 != src + size) ERR_EXIT("xml: zero byte");
+	if (stage != 2) ERR_EXIT("xml: unexpected syntax\n");
+	free(src);
+
+	for (int i = 0; i < found; i++) {
+		printf("Partition %d: name=%s, size=%llim\n", i + 1, partitions[i].name, partitions[i].size);
+		char dfile[40] = { 0 };
+		sprintf(dfile, "%s.bin", partitions[i].name);
+		uint64_t realsize = partitions[i].size << 20;
+		if (strstr(partitions[i].name, "userdata")) continue;
+		else if (strstr(partitions[i].name, "fixnv") || strstr(partitions[i].name, "runtimenv")) realsize -= 0x200;
+		else if (ubi) {
+			int block = partitions[i].size * (1024 / nand_info[2]) + partitions[i].size * (1024 / nand_info[2]) / (512 / nand_info[1]) + 1;
+			realsize = 1024 * (nand_info[2] - 2 * nand_info[0]) * block;
+		}
+		dump_partition(io, partitions[i].name, 0, realsize, dfile, 0x3000);
+	}
+}
+
+void get_Da_Info(spdio_t* io)
+{
+	if (io->raw_len > 6) {
+		if (0x7477656e == *(uint32_t*)(io->raw_buf + 4)) {
+			int len = 8;
+			uint16_t tmp[2];
+			while (len + 2 < io->raw_len)
+			{
+				tmp[0] = 0;
+				tmp[1] = 0;
+				memcpy(tmp, io->raw_buf + len, sizeof(tmp));
+
+				len += sizeof(tmp);
+				if (tmp[0] == 0) Da_Info.bDisableHDLC = *(uint32_t*)(io->raw_buf + len);
+				else if (tmp[0] == 2) Da_Info.bSupportRawData = *(uint8_t*)(io->raw_buf + len);
+				else if (tmp[0] == 3) Da_Info.dwFlushSize = *(uint32_t*)(io->raw_buf + len);
+				else if (tmp[0] == 6) Da_Info.dwStorageType = *(uint32_t*)(io->raw_buf + len);
+				len += tmp[1];
+			}
+		}
+		else memcpy(&Da_Info, io->raw_buf, sizeof(Da_Info));
+	}
+	FILE* fp;
+	fp = fopen("StorageType", "w");
+	if (Da_Info.dwStorageType == 0x101) fprintf(fp, "nand");
+	else if (Da_Info.dwStorageType == 0x102) fprintf(fp, "emmc");
+	else if (Da_Info.dwStorageType == 0x103) fprintf(fp, "ufs");
+	else fprintf(fp, "unknown");
+	fclose(fp);
+	DBG_LOG("FDL2: incompatible partition\n");
 }
