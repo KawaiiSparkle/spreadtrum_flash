@@ -3,7 +3,7 @@
 #define HDLC_ESCAPE 0x7d
 #define FDL1_DUMP_MEM 0
 #define DEFAULT_NAND_ID 0x15
-#define NO_CONFIRM 0
+#define DEFAULT_BLK_SIZE 0xff00
 
 /*
 

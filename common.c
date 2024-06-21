@@ -1,6 +1,7 @@
 #include "common.h"
 #if !USE_LIBUSB
-BOOL FindPort(DWORD* pPort)
+DWORD curPort = 0;
+BOOL FindPort(void)
 {
 	const char* USB_DL = "SPRD U2S Diag";
 	const GUID GUID_DEVCLASS_PORTS = { 0x4d36e978, 0xe325, 0x11ce,{0xbf, 0xc1, 0x08, 0x00, 0x2b, 0xe1, 0x03, 0x18} };
@@ -28,7 +29,7 @@ BOOL FindPort(DWORD* pPort)
 			char portNum_str[4];
 			strncpy(portNum_str, result + strlen(USB_DL) + 5, 3);
 			portNum_str[3] = 0;
-			*pPort = (DWORD)strtol(portNum_str, NULL, 0);
+			curPort = (DWORD)strtol(portNum_str, NULL, 0);
 			break;
 		}
 
@@ -45,6 +46,8 @@ void usleep(unsigned int us)
 	Sleep(us / 1000);
 }
 #endif
+
+extern int m_bOpened;
 
 void print_mem(FILE* f, uint8_t* buf, size_t len) {
 	size_t i; int a, j, n;
@@ -154,14 +157,17 @@ void find_endpoints(libusb_device_handle* dev_handle, int result[2]) {
 
 #define RECV_BUF_LEN (0x8000)
 
+char savepath[ARGC_LEN] = { 0 };
 DA_INFO_T Da_Info;
 
 spdio_t* spdio_init(int flags) {
 	uint8_t* p; spdio_t* io;
 
 	p = (uint8_t*)malloc(sizeof(spdio_t) + RECV_BUF_LEN + (4 + 0x10000 + 2) * 3 + 2);
-	io = (spdio_t*)p; p += sizeof(spdio_t);
+	io = (spdio_t*)p;
 	if (!p) ERR_EXIT("malloc failed\n");
+	memset(io, 0, sizeof(spdio_t));
+	p += sizeof(spdio_t);
 	io->flags = flags;
 	io->recv_len = 0;
 	io->recv_pos = 0;
@@ -176,9 +182,16 @@ spdio_t* spdio_init(int flags) {
 
 void spdio_free(spdio_t* io) {
 	if (!io) return;
+#if _WIN32
+	PostThreadMessage(io->iThread, THRD_MESSAGE_EXIT, 0, 0);
+	WaitForSingleObject(io->hThread, INFINITE);
+	CloseHandle(io->hThread);
+#endif
 #if USE_LIBUSB
 	libusb_close(io->dev_handle);
+	libusb_exit(NULL);
 #else
+	call_DisconnectChannel(io->handle);
 	call_Uninitialize(io->handle);
 	destroyClass(io->handle);
 #endif
@@ -285,6 +298,12 @@ int send_msg(spdio_t* io) {
 	if (!io->enc_len)
 		ERR_EXIT("empty message\n");
 
+#if _WIN32
+	if (m_bOpened == -1) {
+		spdio_free(io);
+		ERR_EXIT("device removed, exiting...\n");
+	}
+#endif
 	if (io->verbose >= 2) {
 		DBG_LOG("send (%d):\n", io->enc_len);
 		print_mem(stderr, io->enc_buf, io->enc_len);
@@ -315,7 +334,7 @@ int send_msg(spdio_t* io) {
 	return ret;
 }
 
-int recv_msg(spdio_t* io) {
+int recv_msg_orig(spdio_t* io) {
 	int a, pos, len, chk;
 	int esc = 0, nread = 0, head_found = 0, plen = 6;
 
@@ -324,18 +343,23 @@ int recv_msg(spdio_t* io) {
 	memset(io->recv_buf, 0, 8);
 	for (;;) {
 		if (pos >= len) {
+#if _WIN32
+			if (m_bOpened == -1) {
+				spdio_free(io);
+				ERR_EXIT("device removed, exiting...\n");
+			}
+#endif
 #if USE_LIBUSB
 			int err = libusb_bulk_transfer(io->dev_handle, io->endp_in, io->recv_buf, RECV_BUF_LEN, &len, io->timeout);
 			if (err == LIBUSB_ERROR_NO_DEVICE)
 				ERR_EXIT("connection closed\n");
-			else if (err == LIBUSB_ERROR_TIMEOUT) break;
 			else if (err < 0)
-				ERR_EXIT("usb_recv failed : %s\n", libusb_error_name(err));
+			{ DBG_LOG("usb_recv failed : %s\n", libusb_error_name(err)); return 0; }
 #else
 			len = call_Read(io->handle, io->recv_buf, RECV_BUF_LEN, io->timeout);
 #endif
 			if (len < 0)
-				ERR_EXIT("usb_recv failed, ret = %d\n", len);
+			{ DBG_LOG("usb_recv failed, ret = %d\n", len); return 0; }
 
 			if (io->verbose >= 2) {
 				DBG_LOG("recv (%d):\n", len);
@@ -348,12 +372,12 @@ int recv_msg(spdio_t* io) {
 		if (io->flags & FLAGS_TRANSCODE) {
 			if (esc && a != (HDLC_HEADER ^ 0x20) &&
 				a != (HDLC_ESCAPE ^ 0x20))
-				ERR_EXIT("unexpected escaped byte (0x%02x)\n", a);
+			{ DBG_LOG("unexpected escaped byte (0x%02x)\n", a); return 0; }
 			if (a == HDLC_HEADER) {
 				if (!head_found) head_found = 1;
 				else if (!nread) continue;
 				else if (nread < plen)
-					ERR_EXIT("recieved message too short\n");
+				{ DBG_LOG("recieved message too short\n"); return 0; }
 				else break;
 			}
 			else if (a == HDLC_ESCAPE) {
@@ -362,7 +386,7 @@ int recv_msg(spdio_t* io) {
 			else {
 				if (!head_found) continue;
 				if (nread >= plen)
-					ERR_EXIT("recieved message too long\n");
+				{ DBG_LOG("recieved message too long\n"); return 0; }
 				io->raw_buf[nread++] = a ^ esc;
 				esc = 0;
 			}
@@ -374,7 +398,7 @@ int recv_msg(spdio_t* io) {
 			}
 			if (nread == plen) {
 				if (a != HDLC_HEADER)
-					ERR_EXIT("expected end of message\n");
+				{ DBG_LOG("expected end of message\n"); return 0; }
 				break;
 			}
 			io->raw_buf[nread++] = a;
@@ -390,10 +414,10 @@ int recv_msg(spdio_t* io) {
 	if (!nread) return 0;
 
 	if (nread < 6)
-		ERR_EXIT("recieved message too short\n");
+	{ DBG_LOG("recieved message too short\n"); return 0; }
 
 	if (nread != plen)
-		ERR_EXIT("bad length (%d, expected %d)\n", nread, plen);
+	{ DBG_LOG("bad length (%d, expected %d)\n", nread, plen); return 0; }
 
 	if (io->flags & FLAGS_CRC16)
 		chk = spd_crc16(0, io->raw_buf, plen - 2);
@@ -411,6 +435,16 @@ int recv_msg(spdio_t* io) {
 	return nread;
 }
 
+int recv_msg(spdio_t* io) {
+	int ret;
+	ret = recv_msg_orig(io);
+	if (!ret) {
+		send_msg(io);
+		ret = recv_msg_orig(io);
+	}
+	return ret;
+}
+
 int recv_msg_timeout(spdio_t* io, int timeout) {
 	int old = io->timeout, ret;
 	io->timeout = old > timeout ? old : timeout;
@@ -420,25 +454,23 @@ int recv_msg_timeout(spdio_t* io, int timeout) {
 }
 
 unsigned recv_type(spdio_t* io) {
-	if (io->raw_len < 6) return -1;
+	//if (io->raw_len < 6) return -1;
 	return READ16_BE(io->raw_buf);
 }
 
-void send_and_check(spdio_t* io) {
+int send_and_check(spdio_t* io) {
 	int ret;
 	send_msg(io);
 	ret = recv_msg(io);
 	if (!ret) ERR_EXIT("timeout reached\n");
 	ret = recv_type(io);
-	if (ret != BSL_REP_ACK)
-		ERR_EXIT("unexpected response (0x%04x)\n", ret);
+	if (ret != BSL_REP_ACK) {
+		DBG_LOG("unexpected response (0x%04x)\n", ret);
+		return -1;
+	}
+	return 0;
 }
 
-#if NO_CONFIRM
-void check_confirm(const char* name) {
-	return;
-}
-#else
 void check_confirm(const char* name) {
 	char buf[4], c; int i;
 	printf("Answer \"yes\" to confirm the \"%s\" command: ", name);
@@ -451,7 +483,6 @@ void check_confirm(const char* name) {
 	} while (0);
 	ERR_EXIT("operation is not confirmed\n");
 }
-#endif
 
 uint8_t* loadfile(const char* fn, size_t* num, size_t extra) {
 	size_t n, j = 0; uint8_t* buf = 0;
@@ -483,14 +514,14 @@ void send_file(spdio_t* io, const char* fn,
 	WRITE32_BE(data + 1, size);
 
 	encode_msg(io, BSL_CMD_START_DATA, data, 4 * 2);
-	send_and_check(io);
+	if (send_and_check(io)) { free(mem); return; }
 
 	for (i = 0; i < size; i += n) {
 		n = size - i;
 		// n = spd_transcode_max(mem + i, size - i, 2048 - 2 - 6);
 		if (n > step) n = step;
 		encode_msg(io, BSL_CMD_MIDST_DATA, mem + i, n);
-		send_and_check(io);
+		if (send_and_check(io)) { free(mem); return; }
 	}
 	free(mem);
 
@@ -506,7 +537,13 @@ unsigned dump_flash(spdio_t* io,
 	const char* fn, unsigned step) {
 	uint32_t n, offset, nread;
 	int ret;
-	FILE* fo = fopen(fn, "wb");
+	FILE* fo;
+	if (savepath[0]) {
+		char fix_fn[1024];
+		sprintf(fix_fn, "%s/%s", savepath, fn);
+		fo = fopen(fix_fn, "wb");
+	}
+	else fo = fopen(fn, "wb");
 	if (!fo) ERR_EXIT("fopen(dump) failed\n");
 
 	for (offset = start; offset < start + len; ) {
@@ -543,7 +580,13 @@ unsigned dump_mem(spdio_t* io,
 	uint32_t start, uint32_t len, const char* fn, unsigned step) {
 	uint32_t n, offset, nread;
 	int ret;
-	FILE* fo = fopen(fn, "wb");
+	FILE* fo;
+	if (savepath[0]) {
+		char fix_fn[2048];
+		sprintf(fix_fn, "%s/%s", savepath, fn);
+		fo = fopen(fix_fn, "wb");
+	}
+	else fo = fopen(fn, "wb");
 	if (!fo) ERR_EXIT("fopen(dump) failed\n");
 
 	for (offset = start; offset < start + len; ) {
@@ -612,9 +655,10 @@ void select_partition(spdio_t* io, const char* name,
 
 #define PROGRESS_BAR_WIDTH 40
 
-void print_progress_bar(uint64_t total, uint64_t progress0, uint64_t progress) {
-	int completed0 = PROGRESS_BAR_WIDTH * progress0 / total;
-	int completed = PROGRESS_BAR_WIDTH * progress / total;
+void print_progress_bar(float progress) {
+	static int completed0 = 0;
+	if (completed0 == PROGRESS_BAR_WIDTH) completed0 = 0;
+	int completed = PROGRESS_BAR_WIDTH * progress;
 	int remaining;
 	if (completed != completed0)
 	{
@@ -626,8 +670,9 @@ void print_progress_bar(uint64_t total, uint64_t progress0, uint64_t progress) {
 		for (int i = 0; i < remaining; i++) {
 			printf(" ");
 		}
-		printf("] %.1f%%\n", 100.0 * progress / total);
+		printf("] %.1f%%\n", 100 * progress);
 	}
+	completed0 = completed;
 }
 
 uint64_t dump_partition(spdio_t* io,
@@ -636,11 +681,39 @@ uint64_t dump_partition(spdio_t* io,
 	uint32_t n, nread, t32; uint64_t offset, n64;
 	int ret, mode64 = (start + len) >> 32;
 	FILE* fo;
+	if (strstr(name, "userdata")) check_confirm("read userdata");
+	if (strstr(name, "fixnv") || strstr(name, "runtimenv"))
+	{
+		char* name_tmp = malloc(strlen(name) + 1);
+		if (name_tmp == NULL) return 0;
+		sprintf(name_tmp, "%s", name);
+		char* dot = strrchr(name_tmp, '1');
+		if (dot != NULL) *dot = '2';
+		select_partition(io, name_tmp, 8, 0, BSL_CMD_READ_START);
+		free(name_tmp);
+		if (send_and_check(io)) return 0;
+
+		uint32_t data[2] = { 8,0 };
+		encode_msg(io, BSL_CMD_READ_MIDST, data, 8);
+		send_msg(io);
+		ret = recv_msg(io);
+		if (!ret) ERR_EXIT("timeout reached\n");
+		if (recv_type(io) != BSL_REP_READ_FLASH) return 0;
+		len = 0x200 + *(uint32_t*)(io->raw_buf + 8);
+		DBG_LOG("nv length: 0x%llx\n", (long long)len);
+		encode_msg(io, BSL_CMD_READ_END, NULL, 0);
+		send_and_check(io);
+	}
 
 	select_partition(io, name, start + len, mode64, BSL_CMD_READ_START);
-	send_and_check(io);
+	if (send_and_check(io)) return 0;
 
-	fo = fopen(fn, "wb");
+	if (savepath[0]) {
+		char fix_fn[2048];
+		sprintf(fix_fn, "%s/%s", savepath, fn);
+		fo = fopen(fix_fn, "wb");
+	}
+	else fo = fopen(fn, "wb");
 	if (!fo) ERR_EXIT("fopen(dump) failed\n");
 
 	for (offset = start; (n64 = start + len - offset); ) {
@@ -665,7 +738,7 @@ uint64_t dump_partition(spdio_t* io,
 			ERR_EXIT("unexpected length\n");
 		if (fwrite(io->raw_buf + 4, 1, nread, fo) != nread)
 			ERR_EXIT("fwrite(dump) failed\n");
-		print_progress_bar(len, offset, offset + nread);
+		print_progress_bar((offset + nread - start) / (float)len);
 		offset += nread;
 		if (n != nread) break;
 	}
@@ -685,7 +758,7 @@ uint64_t read_pactime(spdio_t* io) {
 	unsigned long long time, unix;
 
 	select_partition(io, "miscdata", offset + len, 0, BSL_CMD_READ_START);
-	send_and_check(io);
+	if (send_and_check(io)) return 0;
 
 	WRITE32_LE(data, len);
 	WRITE32_LE(data + 1, offset);
@@ -768,48 +841,150 @@ int scan_xml_partitions(const char* fn, uint8_t* buf, size_t buf_size) {
 	return found;
 }
 
-void partition_list(spdio_t* io, const char* fn) {
-	unsigned size, i, n; char name[37];
-	int ret; FILE* fo = NULL; uint8_t* p;
+#define SECTOR_SIZE 512
+#define MAX_SECTORS 32
 
-	encode_msg(io, BSL_CMD_READ_PARTITION, NULL, 0);
-	send_msg(io);
-	ret = recv_msg(io);
-	if (!ret) ERR_EXIT("timeout reached\n");
-	ret = recv_type(io);
-	if (ret != BSL_REP_READ_PARTITION)
-		ERR_EXIT("unexpected response (0x%04x)\n", ret);
-	size = READ16_BE(io->raw_buf + 2);
-	if (size % 0x4c)
-		ERR_EXIT("not divisible by struct size (0x%04x)\n", size);
-	n = size / 0x4c;
-	if (strcmp(fn, "-")) {
-		fo = fopen(fn, "wb");
-		if (!fo) ERR_EXIT("fopen failed\n");
-		fprintf(fo, "<Partitions>\n");
+int gpt_info(partition_t* ptable, const char* fn_pgpt, const char* fn_xml, int* part_count_ptr) {
+	FILE* fp;
+	if (savepath[0]) {
+		char fix_fn[1024];
+		sprintf(fix_fn, "%s/%s", savepath, fn_pgpt);
+		fp = fopen(fix_fn, "rb");
 	}
-	int divisor = 10;
-	DBG_LOG("detecting sector size\n");
-	p = io->raw_buf + 4;
-	for (i = 0; i < n; i++, p += 0x4c) {
-		size = READ32_LE(p + 0x48);
-		while (!(size >> divisor)) divisor--;
+	else fp = fopen(fn_pgpt, "rb");
+	if (fp == NULL) {
+		return -1;
 	}
-	p = io->raw_buf + 4;
-	for (i = 0; i < n; i++, p += 0x4c) {
-		ret = copy_from_wstr(name, 36, (uint16_t*)p);
-		if (ret) ERR_EXIT("bad partition name\n");
-		size = READ32_LE(p + 0x48);
-		DBG_LOG("[%d] %s, %u (%u)\n", i, name, size >> divisor, size);
-		if (fo) {
-			fprintf(fo, "    <Partition id=\"%s\" size=\"", name);
-			if (i + 1 == n) fprintf(fo, "0x%x\"/>\n", ~0);
-			else fprintf(fo, "%u\"/>\n", size >> divisor);
+	efi_header header;
+	int bytes_read;
+	uint8_t buffer[SECTOR_SIZE];
+	int sector_index = 0;
+	int found = 0;
+
+	while (sector_index < MAX_SECTORS) {
+		bytes_read = fread(buffer, 1, SECTOR_SIZE, fp);
+		if (bytes_read != SECTOR_SIZE) {
+			fclose(fp);
+			return -1;
+		}
+		if (memcmp(buffer, "EFI PART", 8) == 0) {
+			memcpy(&header, buffer, sizeof(header));
+			found = 1;
+			break;
+		}
+		sector_index++;
+	}
+
+	if (found == 0) {
+		fclose(fp);
+		return -1;
+	}
+	int real_SECTOR_SIZE = SECTOR_SIZE * sector_index;
+	efi_entry* entries = malloc(header.number_of_partition_entries * sizeof(efi_entry));
+	if (entries == NULL) {
+		fclose(fp);
+		return -1;
+	}
+	fseek(fp, header.partition_entry_lba * real_SECTOR_SIZE, SEEK_SET);
+	bytes_read = fread(entries, 1, header.number_of_partition_entries * sizeof(efi_entry), fp);
+	if (bytes_read != (int)(header.number_of_partition_entries * sizeof(efi_entry)))
+		printf("only read %d/%d\n", bytes_read, (int)(header.number_of_partition_entries * sizeof(efi_entry)));
+	FILE* fo = fopen(fn_xml, "wb");
+	fprintf(fo, "<Partitions>\n");
+	int n = 0;
+	for (int i = 0; i < header.number_of_partition_entries; i++) {
+		efi_entry entry = *(entries + i);
+		if (entry.starting_lba == 0 && entry.ending_lba == 0) {
+			n = i;
+			break;
 		}
 	}
-	if (fo) {
-		fprintf(fo, "</Partitions>\n");
-		fclose(fo);
+	for (int i = 0; i < n; i++) {
+		efi_entry entry = *(entries + i);
+		copy_from_wstr((*(ptable + i)).name, 36, (uint16_t*)entry.partition_name);
+		uint64_t lba_count = entry.ending_lba - entry.starting_lba + 1;
+		(*(ptable + i)).size = lba_count * real_SECTOR_SIZE;
+		printf("%3d %36s %lldMB\n", i, (*(ptable + i)).name, ((*(ptable + i)).size >> 20));
+		fprintf(fo, "    <Partition id=\"%s\" size=\"", (*(ptable + i)).name);
+		if (i + 1 == n) fprintf(fo, "0x%x\"/>\n", ~0);
+		else fprintf(fo, "%lld\"/>\n", ((*(ptable + i)).size >> 20));
+	}
+	fprintf(fo, "</Partitions>");
+	fclose(fo);
+	free(entries);
+	fclose(fp);
+	*part_count_ptr = n;
+	return 0;
+}
+
+extern int gpt_failed;
+partition_t* partition_list(spdio_t* io, const char* fn, int* part_count_ptr) {
+	long long size;
+	unsigned i, n = 0;
+	int ret; FILE* fo = NULL; uint8_t* p;
+	partition_t* ptable = malloc(128 * sizeof(partition_t));
+	if (ptable == NULL) return NULL;
+	
+	printf("Reading Partition List\n");
+	if (32 * 1024 == dump_partition(io, "user_partition", 0, 32 * 1024, "pgpt.bin", 4096))
+		gpt_failed = gpt_info(ptable, "pgpt.bin", fn, part_count_ptr);
+	if (gpt_failed) {
+		encode_msg(io, BSL_CMD_READ_PARTITION, NULL, 0);
+		send_msg(io);
+		ret = recv_msg(io);
+		if (!ret) ERR_EXIT("timeout reached\n");
+		ret = recv_type(io);
+		if (ret != BSL_REP_READ_PARTITION){
+			DBG_LOG("unexpected response (0x%04x)\n", ret);
+			free(ptable);
+			return NULL;
+		}
+		size = READ16_BE(io->raw_buf + 2);
+		if (size % 0x4c) {
+			DBG_LOG("not divisible by struct size (0x%04llx)\n", size);
+			free(ptable);
+			return NULL;
+		}
+		n = size / 0x4c;
+		if (strcmp(fn, "-")) {
+			fo = fopen(fn, "wb");
+			if (!fo) ERR_EXIT("fopen failed\n");
+			fprintf(fo, "<Partitions>\n");
+		}
+		int divisor = 10;
+		DBG_LOG("detecting sector size\n");
+		p = io->raw_buf + 4;
+		for (i = 0; i < n; i++, p += 0x4c) {
+			size = READ32_LE(p + 0x48);
+			while (!(size >> divisor)) divisor--;
+		}
+		p = io->raw_buf + 4;
+		for (i = 0; i < n; i++, p += 0x4c) {
+			ret = copy_from_wstr((*(ptable + i)).name, 36, (uint16_t*)p);
+			if (ret) ERR_EXIT("bad partition name\n");
+			size = READ32_LE(p + 0x48);
+			(*(ptable + i)).size = (size << 20) >> divisor;
+			printf("%3d %36s %lldMB\n", i, (*(ptable + i)).name, ((*(ptable + i)).size >> 20));
+			if (fo) {
+				fprintf(fo, "    <Partition id=\"%s\" size=\"", (*(ptable + i)).name);
+				if (i + 1 == n) fprintf(fo, "0x%x\"/>\n", ~0);
+				else fprintf(fo, "%lld\"/>\n", ((*(ptable + i)).size >> 20));
+			}
+		}
+		if (fo) {
+			fprintf(fo, "</Partitions>\n");
+			fclose(fo);
+		}
+		*part_count_ptr = n;
+		gpt_failed = 0;
+	}
+	if (*part_count_ptr) {
+		printf("Total number of partitions: %d\n", *part_count_ptr);
+		return ptable;
+	}
+	else {
+		free(ptable);
+		return NULL;
 	}
 }
 
@@ -817,13 +992,11 @@ void repartition(spdio_t* io, const char* fn) {
 	uint8_t* buf = io->temp_buf;
 	int n = scan_xml_partitions(fn, buf, 0xffff);
 	// print_mem(stderr, io->temp_buf, n * 0x4c);
-	check_confirm("repartition");
 	encode_msg(io, BSL_CMD_REPARTITION, buf, n * 0x4c);
 	send_and_check(io);
 }
 
 void erase_partition(spdio_t* io, const char* name) {
-	check_confirm("erase partition");
 	select_partition(io, name, 0, 0, BSL_CMD_ERASE_FLASH);
 	send_and_check(io);
 }
@@ -834,66 +1007,83 @@ void load_partition(spdio_t* io, const char* name,
 	unsigned mode64, n; int ret;
 	FILE* fi;
 
+	if (strstr(name, "runtimenv")) { erase_partition(io, name); return; }
+
 	fi = fopen(fn, "rb");
 	if (!fi) ERR_EXIT("fopen(load) failed\n");
 
+	uint8_t header[4], is_simg = 0;
+	if (fread(header, 1, 4, fi) != 4)
+		ERR_EXIT("fread(load) failed\n");
+	if (0xED26FF3A == *(uint32_t*)header) is_simg = 1;
 	fseeko(fi, 0, SEEK_END);
 	len = ftello(fi);
 	fseek(fi, 0, SEEK_SET);
 	DBG_LOG("file size : 0x%llx\n", (long long)len);
 
 	mode64 = len >> 32;
-	check_confirm("write partition");
 	select_partition(io, name, len, mode64, BSL_CMD_START_DATA);
-	send_and_check(io);
+	if (send_and_check(io)) { fclose(fi); return; }
 
+#if !USE_LIBUSB
 	if (Da_Info.bSupportRawData == 2) {
 		step = Da_Info.dwFlushSize << 10;
 		uint8_t* rawbuf = (uint8_t*)malloc(step);
 		if (!rawbuf) ERR_EXIT("malloc failed\n");
 		encode_msg(io, BSL_CMD_DLOAD_RAW_START2, NULL, 0);
-		send_and_check(io);
+		if (send_and_check(io)) { Da_Info.bSupportRawData = 0; fclose(fi); free(rawbuf); return; }
 
 		for (offset = 0; (n64 = len - offset); offset += n) {
 			n = n64 > step ? step : n64;
+#if _WIN32
+			if (m_bOpened == -1) {
+				spdio_free(io);
+				ERR_EXIT("device removed, exiting...\n");
+			}
+#endif
 			if (fread(rawbuf, 1, n, fi) != n)
 				ERR_EXIT("fread(load) failed\n");
-#if USE_LIBUSB
-			int err = libusb_bulk_transfer(io->dev_handle,
-				io->endp_out, rawbuf, n, &ret, io->timeout);
-			if (err < 0)
-				ERR_EXIT("usb_send failed : %s\n", libusb_error_name(err));
-#else
+//#if USE_LIBUSB
+//			int err = libusb_bulk_transfer(io->dev_handle,
+//				io->endp_out, rawbuf, n, &ret, io->timeout);
+//			if (err < 0)
+//				ERR_EXIT("usb_send failed : %s\n", libusb_error_name(err));
+//#else
 			ret = call_Write(io->handle, rawbuf, n);
-#endif
+//#endif
 			if (io->verbose >= 1) DBG_LOG("send (%d)\n", n);
 			if (ret != (int)n)
 				ERR_EXIT("usb_send failed (%d / %d)\n", ret, n);
-			ret = recv_msg_timeout(io, 15000);
+			if (is_simg) ret = recv_msg_timeout(io, 100000);
+			else ret = recv_msg_timeout(io, 15000);
 			if (!ret) ERR_EXIT("timeout reached\n");
 			if ((ret = recv_type(io)) != BSL_REP_ACK) {
 				DBG_LOG("unexpected response (0x%04x)\n", ret);
 				break;
 			}
-			print_progress_bar(len, offset, offset + n);
+			print_progress_bar((offset + n) / (float)len);
 		}
-	}
-	else {
+		free(rawbuf);
+	} else {
+#endif
 		for (offset = 0; (n64 = len - offset); offset += n) {
 			n = n64 > step ? step : n64;
 			if (fread(io->temp_buf, 1, n, fi) != n)
 				ERR_EXIT("fread(load) failed\n");
 			encode_msg(io, BSL_CMD_MIDST_DATA, io->temp_buf, n);
 			send_msg(io);
-			ret = recv_msg_timeout(io, 15000);
+			if (is_simg) ret = recv_msg_timeout(io, 100000);
+			else ret = recv_msg_timeout(io, 15000);
 			if (!ret) ERR_EXIT("timeout reached\n");
 			if ((ret = recv_type(io)) != BSL_REP_ACK) {
 				DBG_LOG("unexpected response (0x%04x)\n", ret);
 				break;
 			}
-			print_progress_bar(len, offset, offset + n);
+			print_progress_bar((offset + n) / (float)len);
 		}
+#if !USE_LIBUSB
 	}
+#endif
 	DBG_LOG("load_partition: %s, target: 0x%llx, written: 0x%llx\n",
 		name, (long long)len, (long long)offset);
 	fclose(fi);
@@ -960,7 +1150,7 @@ void load_nv_partition(spdio_t* io, const char* name,
 		len = 0;
 
 		if (!output) ERR_EXIT("malloc failed\n");
-		if (*(uint32_t*)mem == 0x00004e56) memOffset = 0x200;;
+		if (*(uint32_t*)mem == 0x00004e56) memOffset = 0x200;
 
 		len += sizeof(uint32_t);
 
@@ -997,7 +1187,6 @@ void load_nv_partition(spdio_t* io, const char* name,
 	cs += (crc >> 8) & 0xff;
 	WRITE16_BE(mem, crc);
 
-	check_confirm("write partition");
 	{
 		struct {
 			uint16_t name[36];
@@ -1010,7 +1199,7 @@ void load_nv_partition(spdio_t* io, const char* name,
 		WRITE32_LE(&pkt.cs, cs);
 		encode_msg(io, BSL_CMD_START_DATA, &pkt, sizeof(pkt));
 	}
-	send_and_check(io);
+	if (send_and_check(io)) { free(mem); return; }
 
 	for (offset = 0; (rsz = len - offset); offset += n) {
 		n = rsz > step ? step : rsz;
@@ -1031,12 +1220,38 @@ void load_nv_partition(spdio_t* io, const char* name,
 	send_and_check(io);
 }
 
-int64_t find_partition_size(spdio_t* io, const char* name) {
-	uint32_t t32; uint64_t n64; long long offset = 0;
+void find_partition_size_new(spdio_t* io, const char* name, unsigned long long *offset_ptr) {
+	int ret;
+	char* name_tmp = malloc(strlen(name) + 5 + 1);
+	if (name_tmp == NULL) return;
+	sprintf(name_tmp, "%s_size", name);
+	select_partition(io, name_tmp, 0x80, 0, BSL_CMD_READ_START);
+	free(name_tmp);
+	if (send_and_check(io)) return;
+
+	uint32_t data[2] = { 0x80,0 };
+	encode_msg(io, BSL_CMD_READ_MIDST, data, 8);
+	send_msg(io);
+	ret = recv_msg(io);
+	if (!ret) ERR_EXIT("timeout reached\n");
+	if (recv_type(io) == BSL_REP_READ_FLASH) {
+		ret = sscanf((char *)(io->raw_buf + 4), "size:%*[^:]: 0x%llx", offset_ptr);
+		DBG_LOG("partition_size_device: %s, 0x%llx\n", name, *offset_ptr);
+	}
+	encode_msg(io, BSL_CMD_READ_END, NULL, 0);
+	send_and_check(io);
+}
+
+uint64_t find_partition_size(spdio_t* io, const char* name) {
+	uint32_t t32; uint64_t n64; unsigned long long offset = 0;
 	int ret, i, start = 47;
 
+	if (strstr(name, "fixnv") || strstr(name, "runtimenv")) return 1;
+	find_partition_size_new(io, name, &offset);
+	if (offset) return offset;
+
 	select_partition(io, name, 1ll << (start + 1), 1, BSL_CMD_READ_START);
-	send_and_check(io);
+	if (send_and_check(io)) return 0;
 
 	for (i = start; i >= 20; i--) {
 		uint32_t data[3];
@@ -1054,7 +1269,7 @@ int64_t find_partition_size(spdio_t* io, const char* name) {
 		if (ret != BSL_REP_READ_FLASH) continue;
 		offset = n64 + (1 << 20);
 	}
-	DBG_LOG("partition_size: %s, 0x%llx\n", name, offset);
+	DBG_LOG("partition_size_pc: %s, 0x%llx\n", name, offset);
 	encode_msg(io, BSL_CMD_READ_END, NULL, 0);
 	send_and_check(io);
 	return offset;
@@ -1102,12 +1317,7 @@ uint64_t str_to_size_ubi(const char* str, int* nand_info) {
 	}
 }
 
-typedef struct {
-	char name[36];
-	long long size;
-} partition_t;
-
-void dump_partitions(spdio_t* io, int* nand_info, const char* fn) {
+void dump_partitions(spdio_t* io, const char* fn, int* nand_info, int blk_size) {
 	partition_t partitions[128];
 	const char* part1 = "Partitions>";
 	char* src, * p;
@@ -1165,21 +1375,80 @@ void dump_partitions(spdio_t* io, int* nand_info, const char* fn) {
 	}
 	if (p - 1 != src + size) ERR_EXIT("xml: zero byte");
 	if (stage != 2) ERR_EXIT("xml: unexpected syntax\n");
-	free(src);
 
 	for (int i = 0; i < found; i++) {
 		printf("Partition %d: name=%s, size=%llim\n", i + 1, partitions[i].name, partitions[i].size);
-		char dfile[40] = { 0 };
+		char dfile[40];
 		sprintf(dfile, "%s.bin", partitions[i].name);
 		uint64_t realsize = partitions[i].size << 20;
 		if (strstr(partitions[i].name, "userdata")) continue;
-		else if (strstr(partitions[i].name, "fixnv") || strstr(partitions[i].name, "runtimenv")) realsize -= 0x200;
+		else if (strstr(partitions[i].name, "splloader")) continue;
 		else if (ubi) {
 			int block = partitions[i].size * (1024 / nand_info[2]) + partitions[i].size * (1024 / nand_info[2]) / (512 / nand_info[1]) + 1;
 			realsize = 1024 * (nand_info[2] - 2 * nand_info[0]) * block;
 		}
-		dump_partition(io, partitions[i].name, 0, realsize, dfile, 0x3000);
+		dump_partition(io, partitions[i].name, 0, realsize, dfile, blk_size);
 	}
+	printf("Always backup splloader\n");
+	dump_partition(io, "splloader", 0, 256 * 1024, "splloader.bin", blk_size);
+
+	if (savepath[0]) {
+		printf("saving part table\n");
+		char fix_fn[1024];
+		sprintf(fix_fn, "%s/%s", savepath, fn);
+		FILE *fo = fopen(fix_fn, "wb");
+		fwrite(src, 1, size, fo);
+		fclose(fo);
+	}
+	free(src);
+}
+
+void load_partitions(spdio_t* io, const char* path, int blk_size) {
+	char* fn;
+#if _WIN32
+	char searchPath[ARGC_LEN];
+	snprintf(searchPath, ARGC_LEN, "%s\\*", path);
+
+	WIN32_FIND_DATAA findData;
+	HANDLE hFind = FindFirstFileA(searchPath, &findData);
+
+	if (hFind == INVALID_HANDLE_VALUE) {
+		printf("Error opening directory.\n");
+		return;
+	}
+	for (fn = findData.cFileName; FindNextFileA(hFind, &findData); fn = findData.cFileName)
+#else
+	DIR* dir;
+	struct dirent* entry;
+
+	if ((dir = opendir(path)) == NULL || (entry = readdir(dir)) == NULL) {
+		printf("Error opening directory.\n");
+		return;
+	}
+	for (fn = entry->d_name; (entry = readdir(dir)); fn = entry->d_name)
+#endif
+	{
+		if (strcmp(fn, ".") == 0
+			|| strcmp(fn, "..") == 0
+			|| strcmp(fn + strlen(fn) - 4, ".xml") == 0) {
+			continue;
+		}
+		char fix_fn[1024];
+		snprintf(fix_fn, sizeof(fix_fn), "%s/%s", path, fn);
+		char* dot = strrchr(fn, '.');
+		if (dot != NULL) *dot = '\0';
+		if (strstr(fn, "fixnv1"))
+			load_nv_partition(io, fn, fix_fn, 4096);
+		else if (strstr(fn, "pgpt"))
+			continue;
+		else
+			load_partition(io, fn, fix_fn, blk_size);
+	}
+#if _WIN32
+	FindClose(hFind);
+#else
+	closedir(dir);
+#endif
 }
 
 void get_Da_Info(spdio_t* io)
@@ -1202,7 +1471,7 @@ void get_Da_Info(spdio_t* io)
 				len += tmp[1];
 			}
 		}
-		else memcpy(&Da_Info, io->raw_buf, sizeof(Da_Info));
+		else memcpy(&Da_Info, io->raw_buf + 4, io->raw_len - 6);
 	}
 	FILE* fp;
 	fp = fopen("StorageType", "w");
@@ -1213,3 +1482,192 @@ void get_Da_Info(spdio_t* io)
 	fclose(fp);
 	DBG_LOG("FDL2: incompatible partition\n");
 }
+
+#if _WIN32
+const _TCHAR CLASS_NAME[] = _T("Sample Window Class");
+
+HWND hWnd;
+
+LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
+{
+	static BOOL interface_checked = FALSE;
+	switch (message)
+	{
+	case WM_DEVICECHANGE:
+		if (DBT_DEVICEARRIVAL == wParam || DBT_DEVICEREMOVECOMPLETE == wParam)
+		{
+			PDEV_BROADCAST_HDR pHdr = (PDEV_BROADCAST_HDR)lParam;
+			PDEV_BROADCAST_DEVICEINTERFACE pDevInf;
+			PDEV_BROADCAST_PORT pDevPort;
+			switch (pHdr->dbch_devicetype)
+			{
+			case DBT_DEVTYP_DEVICEINTERFACE:
+				pDevInf = (PDEV_BROADCAST_DEVICEINTERFACE)pHdr;
+				if (my_strstr(pDevInf->dbcc_name, _T("VID_1782&PID_4D00"))) {
+#if USE_LIBUSB
+					if (DBT_DEVICEREMOVECOMPLETE == wParam) m_bOpened = -1;
+#else
+					interface_checked = TRUE;
+#endif
+				}
+				break;
+#if !USE_LIBUSB
+			case DBT_DEVTYP_PORT:
+				if (interface_checked) {
+					pDevPort = (PDEV_BROADCAST_PORT)pHdr;
+					DWORD changedPort = (DWORD)my_strtol(pDevPort->dbcp_name + 3, NULL, 0);
+					if (DBT_DEVICEARRIVAL == wParam) {
+						if (!curPort) curPort = changedPort;
+						else if (curPort != changedPort) printf("second port not supported\n");
+					}
+					else if (curPort == changedPort) m_bOpened = -1;
+				}
+				interface_checked = FALSE;
+				break;
+#endif
+			}
+		}
+	}
+
+	return DefWindowProc(hWnd, message, wParam, lParam);
+}
+
+DWORD WINAPI ThrdFunc(LPVOID lpParam)
+{
+	WNDCLASS wc = { 0 };
+	wc.lpfnWndProc = WndProc;
+	wc.hInstance = GetModuleHandle(NULL);
+	wc.lpszClassName = CLASS_NAME;
+	if (0 == RegisterClass(&wc)) return -1;
+
+	hWnd = CreateWindowEx(0, CLASS_NAME, _T(""), WS_OVERLAPPEDWINDOW,
+		CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
+		NULL,       // Parent window
+		NULL,       // Menu
+		GetModuleHandle(NULL),  // Instance handle
+		NULL        // Additional application data
+	);
+	if (hWnd==NULL) return -1;
+
+	HDEVNOTIFY hDevNotify;
+	DEV_BROADCAST_DEVICEINTERFACE NotificationFilter;
+#if USE_LIBUSB
+	const GUID GUID_DEVINTERFACE = { 0xa5dcbf10, 0x6530, 0x11d2, { 0x90, 0x1f, 0x00, 0xc0, 0x4f, 0xb9, 0x51, 0xed } };
+#else
+	const GUID GUID_DEVINTERFACE = { 0x86e0d1e0, 0x8089, 0x11d0, { 0x9c, 0xe4, 0x08, 0x00, 0x3e, 0x30, 0x1f, 0x73 } };
+#endif
+	ZeroMemory(&NotificationFilter, sizeof(NotificationFilter));
+	NotificationFilter.dbcc_size = sizeof(DEV_BROADCAST_DEVICEINTERFACE);
+	NotificationFilter.dbcc_devicetype = DBT_DEVTYP_DEVICEINTERFACE;
+	NotificationFilter.dbcc_classguid = GUID_DEVINTERFACE;
+	hDevNotify = RegisterDeviceNotification(hWnd, &NotificationFilter, DEVICE_NOTIFY_WINDOW_HANDLE);
+
+	MSG msg;
+	while (GetMessage(&msg, NULL, 0, 0))
+	{
+		if (msg.message == THRD_MESSAGE_EXIT) break;
+		TranslateMessage(&msg);
+		DispatchMessage(&msg);
+	}
+
+	return 0;
+}
+#if !USE_LIBUSB
+typedef enum
+{
+	CHANNEL_TYPE_COM = 0,
+	CHANNEL_TYPE_SOCKET = 1,
+	CHANNEL_TYPE_FILE = 2,
+	CHANNEL_TYPE_USBMON = 3         // USB monitor
+}CHANNEL_TYPE;
+
+typedef struct _CHANNEL_ATTRIBUTE
+{
+	CHANNEL_TYPE ChannelType;
+
+	union {
+		// ComPort
+		struct {
+			DWORD  dwPortNum;
+			DWORD  dwBaudRate;
+		} Com;
+
+		// Socket
+		struct {
+			DWORD dwPort;
+			DWORD dwIP;
+			DWORD dwFlag; //[in]: 0, Server; 1, Client; [out]: client ID.		               
+		} Socket;
+
+		// File
+		struct {
+			DWORD  dwPackSize;
+			DWORD  dwPackFreq;
+			WCHAR* pFilePath;
+		} File;
+	};
+
+} CHANNEL_ATTRIBUTE, * PCHANNEL_ATTRIBUTE;
+
+typedef const PCHANNEL_ATTRIBUTE PCCHANNEL_ATTRIBUTE;
+
+typedef void* (*SP_CreatePhoneFunc)(void* pLogUtil);
+typedef void (*SP_ReleasePhoneFunc)(void* hDiagPhone);
+typedef int (*SP_BeginPhoneTestFunc)(void* hDiagPhone, PCCHANNEL_ATTRIBUTE pOpenArgument);
+typedef int (*SP_EndPhoneTestFunc)(void* hDiagPhone);
+typedef int (*SP_GetUsbPortFunc)(void* hDiagPhone);
+typedef int (*SP_EnterModeProcessFunc)(void* hDiagPhone, BOOL bUsbDevice, int nExpPort, int ePhoneMode, HANDLE hMonitorEvent, unsigned long ulTimeOut);
+
+SP_CreatePhoneFunc SP_CreatePhonePtr = NULL;
+SP_ReleasePhoneFunc SP_ReleasePhonePtr = NULL;
+SP_BeginPhoneTestFunc SP_BeginPhoneTestPtr = NULL;
+SP_EndPhoneTestFunc SP_EndPhoneTestPtr = NULL;
+SP_GetUsbPortFunc SP_GetUsbPortPtr = NULL;
+SP_EnterModeProcessFunc SP_EnterModeProcessPtr = NULL;
+
+BOOL ChangeMode(spdio_t* io)
+{
+	HMODULE m_hSPLib = LoadLibrary(_T("PhoneCommand.dll"));
+	if (m_hSPLib == NULL)
+	{
+		return FALSE;
+	}
+
+	SP_CreatePhonePtr = (SP_CreatePhoneFunc)GetProcAddress(m_hSPLib, "SP_CreatePhone");
+	SP_ReleasePhonePtr = (SP_ReleasePhoneFunc)GetProcAddress(m_hSPLib, "SP_ReleasePhone");
+	SP_BeginPhoneTestPtr = (SP_BeginPhoneTestFunc)GetProcAddress(m_hSPLib, "SP_BeginPhoneTest");
+	SP_EndPhoneTestPtr = (SP_EndPhoneTestFunc)GetProcAddress(m_hSPLib, "SP_EndPhoneTest");
+	SP_GetUsbPortPtr = (SP_GetUsbPortFunc)GetProcAddress(m_hSPLib, "SP_GetUsbPort");
+	SP_EnterModeProcessPtr = (SP_EnterModeProcessFunc)GetProcAddress(m_hSPLib, "SP_EnterModeProcess");
+
+	void* hDiagPhone = SP_CreatePhonePtr(NULL);
+	CHANNEL_ATTRIBUTE ca;
+	ca.ChannelType = CHANNEL_TYPE_USBMON;
+	SP_BeginPhoneTestPtr(hDiagPhone, &ca);
+
+	HANDLE  m_hEnterModeSuccess = CreateEvent(NULL, TRUE, FALSE, NULL);
+	if (m_hEnterModeSuccess == NULL) return FALSE;
+	ResetEvent(m_hEnterModeSuccess);
+	SP_EnterModeProcessPtr(hDiagPhone, TRUE, -1, 2, m_hEnterModeSuccess, 0); //0x82 is download mode
+
+	ULONGLONG tBegin;
+	ULONGLONG tCur;
+	tBegin = GetTickCount64();
+	do
+	{
+		tCur = GetTickCount64();
+		DWORD dwRet = WaitForSingleObject(m_hEnterModeSuccess, 1000);
+		if (WAIT_OBJECT_0 == dwRet)
+		{
+			curPort = SP_GetUsbPortPtr(hDiagPhone);
+			SP_EndPhoneTestPtr(hDiagPhone);
+			SP_ReleasePhonePtr(hDiagPhone);
+			FreeLibrary(m_hSPLib);
+			m_hSPLib = NULL;
+			return TRUE;
+		}
+	} while ((tCur - tBegin) < 30000);
+	return FALSE;
+}
+#endif
+#endif
