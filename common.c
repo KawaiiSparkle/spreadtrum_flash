@@ -682,7 +682,7 @@ uint64_t dump_partition(spdio_t* io,
 	int ret, mode64 = (start + len) >> 32;
 	FILE* fo;
 	if (strstr(name, "userdata")) check_confirm("read userdata");
-	if (strstr(name, "fixnv") || strstr(name, "runtimenv"))
+	else if (strstr(name, "fixnv") || strstr(name, "runtimenv"))
 	{
 		char* name_tmp = malloc(strlen(name) + 1);
 		if (name_tmp == NULL) return 0;
@@ -699,8 +699,12 @@ uint64_t dump_partition(spdio_t* io,
 		ret = recv_msg(io);
 		if (!ret) ERR_EXIT("timeout reached\n");
 		if (recv_type(io) != BSL_REP_READ_FLASH) return 0;
-		len = 0x200 + *(uint32_t*)(io->raw_buf + 8);
-		DBG_LOG("nv length: 0x%llx\n", (long long)len);
+		if (*(uint32_t*)(io->raw_buf + 4) == 0x00004e56)
+		{
+			if (dot != NULL) len = *(uint32_t*)(io->raw_buf + 8);
+			else len = 0x200 + *(uint32_t*)(io->raw_buf + 8);
+			DBG_LOG("nv length: 0x%llx\n", (long long)len);
+		}
 		encode_msg(io, BSL_CMD_READ_END, NULL, 0);
 		send_and_check(io);
 	}
@@ -899,12 +903,13 @@ int gpt_info(partition_t* ptable, const char* fn_pgpt, const char* fn_xml, int* 
 			break;
 		}
 	}
+	printf("  0 %36s 256KB\n", "splloader");
 	for (int i = 0; i < n; i++) {
 		efi_entry entry = *(entries + i);
 		copy_from_wstr((*(ptable + i)).name, 36, (uint16_t*)entry.partition_name);
 		uint64_t lba_count = entry.ending_lba - entry.starting_lba + 1;
 		(*(ptable + i)).size = lba_count * real_SECTOR_SIZE;
-		printf("%3d %36s %lldMB\n", i, (*(ptable + i)).name, ((*(ptable + i)).size >> 20));
+		printf("%3d %36s %lldMB\n", i + 1, (*(ptable + i)).name, ((*(ptable + i)).size >> 20));
 		fprintf(fo, "    <Partition id=\"%s\" size=\"", (*(ptable + i)).name);
 		if (i + 1 == n) fprintf(fo, "0x%x\"/>\n", ~0);
 		else fprintf(fo, "%lld\"/>\n", ((*(ptable + i)).size >> 20));
@@ -914,6 +919,8 @@ int gpt_info(partition_t* ptable, const char* fn_pgpt, const char* fn_xml, int* 
 	free(entries);
 	fclose(fp);
 	*part_count_ptr = n;
+	printf("standard gpt table saved to pgpt.bin\n");
+	printf("skip saving sprd partition list packet\n");
 	return 0;
 }
 
@@ -945,6 +952,16 @@ partition_t* partition_list(spdio_t* io, const char* fn, int* part_count_ptr) {
 			free(ptable);
 			return NULL;
 		}
+		FILE *fpkt;
+		if (savepath[0]) {
+			char fix_fn[1024];
+			sprintf(fix_fn, "%s/sprdpart.bin", savepath);
+			fpkt = fopen(fix_fn, "wb");
+		}
+		else fpkt = fopen("sprdpart.bin", "wb");
+		if (!fpkt) ERR_EXIT("fopen failed\n");
+		fwrite(io->raw_buf + 4, 1, size, fpkt);
+		fclose(fpkt);
 		n = size / 0x4c;
 		if (strcmp(fn, "-")) {
 			fo = fopen(fn, "wb");
@@ -959,12 +976,13 @@ partition_t* partition_list(spdio_t* io, const char* fn, int* part_count_ptr) {
 			while (!(size >> divisor)) divisor--;
 		}
 		p = io->raw_buf + 4;
+		printf("  0 %36s 256KB\n", "splloader");
 		for (i = 0; i < n; i++, p += 0x4c) {
 			ret = copy_from_wstr((*(ptable + i)).name, 36, (uint16_t*)p);
 			if (ret) ERR_EXIT("bad partition name\n");
 			size = READ32_LE(p + 0x48);
 			(*(ptable + i)).size = (size << 20) >> divisor;
-			printf("%3d %36s %lldMB\n", i, (*(ptable + i)).name, ((*(ptable + i)).size >> 20));
+			printf("%3d %36s %lldMB\n", i + 1, (*(ptable + i)).name, ((*(ptable + i)).size >> 20));
 			if (fo) {
 				fprintf(fo, "    <Partition id=\"%s\" size=\"", (*(ptable + i)).name);
 				if (i + 1 == n) fprintf(fo, "0x%x\"/>\n", ~0);
@@ -976,9 +994,12 @@ partition_t* partition_list(spdio_t* io, const char* fn, int* part_count_ptr) {
 			fclose(fo);
 		}
 		*part_count_ptr = n;
+		printf("unable to get standard gpt table\n");
+		printf("sprd partition list packet saved to sprdpart.bin\n");
 		gpt_failed = 0;
 	}
 	if (*part_count_ptr) {
+		printf("partition list saved to partition.xml\n");
 		printf("Total number of partitions: %d\n", *part_count_ptr);
 		return ptable;
 	}
@@ -1027,11 +1048,11 @@ void load_partition(spdio_t* io, const char* name,
 
 #if !USE_LIBUSB
 	if (Da_Info.bSupportRawData == 2) {
+		encode_msg(io, BSL_CMD_DLOAD_RAW_START2, NULL, 0);
+		if (send_and_check(io)) { Da_Info.bSupportRawData = 0; goto fallback_load; }
 		step = Da_Info.dwFlushSize << 10;
 		uint8_t* rawbuf = (uint8_t*)malloc(step);
 		if (!rawbuf) ERR_EXIT("malloc failed\n");
-		encode_msg(io, BSL_CMD_DLOAD_RAW_START2, NULL, 0);
-		if (send_and_check(io)) { Da_Info.bSupportRawData = 0; fclose(fi); free(rawbuf); return; }
 
 		for (offset = 0; (n64 = len - offset); offset += n) {
 			n = n64 > step ? step : n64;
@@ -1066,6 +1087,7 @@ void load_partition(spdio_t* io, const char* name,
 		free(rawbuf);
 	} else {
 #endif
+		fallback_load:
 		for (offset = 0; (n64 = len - offset); offset += n) {
 			n = n64 > step ? step : n64;
 			if (fread(io->temp_buf, 1, n, fi) != n)
@@ -1084,11 +1106,10 @@ void load_partition(spdio_t* io, const char* name,
 #if !USE_LIBUSB
 	}
 #endif
-	DBG_LOG("load_partition: %s, target: 0x%llx, written: 0x%llx\n",
-		name, (long long)len, (long long)offset);
 	fclose(fi);
 	encode_msg(io, BSL_CMD_END_DATA, NULL, 0);
-	send_and_check(io);
+	if(!send_and_check(io)) DBG_LOG("load_partition: %s, target: 0x%llx, written: 0x%llx\n",
+		name, (long long)len, (long long)offset);
 }
 
 unsigned short const crc16_table[256] = {
@@ -1213,11 +1234,10 @@ void load_nv_partition(spdio_t* io, const char* name,
 			break;
 		}
 	}
-	DBG_LOG("load_nv_partition: %s, target: 0x%llx, written: 0x%llx\n",
-		name, (long long)len, (long long)offset);
 	free(mem);
 	encode_msg(io, BSL_CMD_END_DATA, NULL, 0);
-	send_and_check(io);
+	if(!send_and_check(io)) DBG_LOG("load_nv_partition: %s, target: 0x%llx, written: 0x%llx\n",
+		name, (long long)len, (long long)offset);
 }
 
 void find_partition_size_new(spdio_t* io, const char* name, unsigned long long *offset_ptr) {
@@ -1382,18 +1402,20 @@ void dump_partitions(spdio_t* io, const char* fn, int* nand_info, int blk_size) 
 		sprintf(dfile, "%s.bin", partitions[i].name);
 		uint64_t realsize = partitions[i].size << 20;
 		if (strstr(partitions[i].name, "userdata")) continue;
-		else if (strstr(partitions[i].name, "splloader")) continue;
+		else if (strstr(partitions[i].name, "splloader")) realsize = 256 * 1024;
+		else if (0xffffffff == partitions[i].size) {
+			realsize = find_partition_size(io, partitions[i].name);
+			if (!realsize) { DBG_LOG("unable to get part size of %s\n", partitions[i].name); continue; }
+		}
 		else if (ubi) {
 			int block = partitions[i].size * (1024 / nand_info[2]) + partitions[i].size * (1024 / nand_info[2]) / (512 / nand_info[1]) + 1;
 			realsize = 1024 * (nand_info[2] - 2 * nand_info[0]) * block;
 		}
 		dump_partition(io, partitions[i].name, 0, realsize, dfile, blk_size);
 	}
-	printf("Always backup splloader\n");
-	dump_partition(io, "splloader", 0, 256 * 1024, "splloader.bin", blk_size);
 
 	if (savepath[0]) {
-		printf("saving part table\n");
+		printf("saving dump list\n");
 		char fix_fn[1024];
 		sprintf(fix_fn, "%s/%s", savepath, fn);
 		FILE *fo = fopen(fix_fn, "wb");
@@ -1417,6 +1439,8 @@ void load_partitions(spdio_t* io, const char* path, int blk_size) {
 		return;
 	}
 	for (fn = findData.cFileName; FindNextFileA(hFind, &findData); fn = findData.cFileName)
+	{
+		if (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
 #else
 	DIR* dir;
 	struct dirent* entry;
@@ -1426,20 +1450,18 @@ void load_partitions(spdio_t* io, const char* path, int blk_size) {
 		return;
 	}
 	for (fn = entry->d_name; (entry = readdir(dir)); fn = entry->d_name)
-#endif
 	{
-		if (strcmp(fn, ".") == 0
-			|| strcmp(fn, "..") == 0
-			|| strcmp(fn + strlen(fn) - 4, ".xml") == 0) {
-			continue;
-		}
+		if (entry->d_type == DT_DIR) continue;
+#endif
+		size_t len = strlen(fn);
+		if (len >= 4 && strcmp(fn + len - 4, ".xml") == 0) continue;
 		char fix_fn[1024];
 		snprintf(fix_fn, sizeof(fix_fn), "%s/%s", path, fn);
 		char* dot = strrchr(fn, '.');
 		if (dot != NULL) *dot = '\0';
 		if (strstr(fn, "fixnv1"))
 			load_nv_partition(io, fn, fix_fn, 4096);
-		else if (strstr(fn, "pgpt"))
+		else if (strstr(fn, "pgpt") || strstr(fn, "sprdpart"))
 			continue;
 		else
 			load_partition(io, fn, fix_fn, blk_size);
@@ -1625,7 +1647,7 @@ SP_EndPhoneTestFunc SP_EndPhoneTestPtr = NULL;
 SP_GetUsbPortFunc SP_GetUsbPortPtr = NULL;
 SP_EnterModeProcessFunc SP_EnterModeProcessPtr = NULL;
 
-BOOL ChangeMode(spdio_t* io)
+BOOL ChangeMode(int ms)
 {
 	HMODULE m_hSPLib = LoadLibrary(_T("PhoneCommand.dll"));
 	if (m_hSPLib == NULL)
@@ -1666,7 +1688,7 @@ BOOL ChangeMode(spdio_t* io)
 			m_hSPLib = NULL;
 			return TRUE;
 		}
-	} while ((tCur - tBegin) < 30000);
+	} while ((tCur - tBegin) < ms);
 	return FALSE;
 }
 #endif

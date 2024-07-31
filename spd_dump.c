@@ -88,7 +88,10 @@ int main(int argc, char **argv) {
 			} else {
 				DBG_LOG("Waiting for connection (%ds)\n", wait / REOPEN_FREQ);
 #if !USE_LIBUSB
-				if (m_DownloadByPoweroff) ChangeMode(io);
+				if (m_DownloadByPoweroff) {
+					ChangeMode(wait / REOPEN_FREQ * 1000);
+					wait = 10 * REOPEN_FREQ;
+				}
 				if (!curPort) FindPort();
 				io->hThread = CreateThread(NULL, 0, ThrdFunc, NULL, 0, &io->iThread);
 				if (io->hThread == NULL) {
@@ -368,18 +371,37 @@ int main(int argc, char **argv) {
 			const char* name = argv[2];
 			if (argc <= 2) ERR_EXIT("r all/part_name\n");
 			if (gpt_failed == 1) ptable = partition_list(io, "partition.xml", &part_count);
-			if (!part_count) {
-				realsize = find_partition_size(io, argv[2]);
+			if (strstr(name, "splloader")) {
+				realsize = 256 * 1024;
+			}
+			else if (!part_count) {
+				realsize = find_partition_size(io, name);
 				if (!realsize) { DBG_LOG("unable to get part size of %s\n", name); argc -= 2; argv += 2; continue; }
 			}
-			else if (!strcmp(argv[2], "all")) {
-				dump_partitions(io, "partition.xml", nand_info, blk_size ? blk_size : DEFAULT_BLK_SIZE);
+			else if (!strcmp(name, "preset_modem")) {
+				for (i = 0; i < part_count; i++)
+					if (0 == strncmp("l_", (*(ptable + i)).name, 2) || 0 == strncmp("nr_", (*(ptable + i)).name, 3)) {
+						char dfile[40];
+						sprintf(dfile, "%s.bin", (*(ptable + i)).name);
+						dump_partition(io, (*(ptable + i)).name, 0, (*(ptable + i)).size, dfile, blk_size ? blk_size : DEFAULT_BLK_SIZE);
+					}
+				argc -= 2; argv += 2;
+				continue;
+			}
+			else if (!strcmp(name, "all")) {
+				dump_partition(io, "splloader", 0, 256 * 1024, "splloader.bin", blk_size ? blk_size : DEFAULT_BLK_SIZE);
+				for (i = 0; i < part_count; i++)
+				{
+					char dfile[40];
+					sprintf(dfile, "%s.bin", (*(ptable + i)).name);
+					dump_partition(io, (*(ptable + i)).name, 0, (*(ptable + i)).size, dfile, blk_size ? blk_size : DEFAULT_BLK_SIZE);
+				}
 				argc -= 2; argv += 2;
 				continue;
 			}
 			else {
 				for (i = 0; i < part_count; i++)
-					if (!strcmp(argv[2], (*(ptable + i)).name)) {
+					if (!strcmp(name, (*(ptable + i)).name)) {
 						realsize = (*(ptable + i)).size;
 						break;
 					}
@@ -445,7 +467,12 @@ int main(int argc, char **argv) {
 
 		} else if (!strcmp(argv[1], "skip_confirm")) {
 			if (argc <= 2) ERR_EXIT("skip_confirm {0,1}\n");
-			skip_confirm = strtol(argv[2], NULL, 0);
+			skip_confirm = atoi(argv[2]);
+			argc -= 2; argv += 2;
+
+		} else if (!strcmp(argv[1], "rawdata")) {
+			if (argc <= 2) ERR_EXIT("rawdata {0,1,2}\n");
+			Da_Info.bSupportRawData = atoi(argv[2]);
 			argc -= 2; argv += 2;
 
 		} else if (!strcmp(argv[1], "chip_uid")) {
@@ -506,7 +533,7 @@ int main(int argc, char **argv) {
 
 		} else {
 #if !USE_LIBUSB
-			DBG_LOG("baudrate rate\n\tbrom stage only\n");
+			DBG_LOG("baudrate rate\n");
 #endif
 			DBG_LOG("exec_addr addr\n\tbrom stage only\n");
 			DBG_LOG("fdl FILE addr\n");
@@ -527,6 +554,7 @@ int main(int argc, char **argv) {
 			DBG_LOG("poweroff\n");
 			DBG_LOG("timeout ms\n");
 			DBG_LOG("skip_confirm {0,1}\n");
+			DBG_LOG("rawdata {0,1,2}\n\tfdl2 stage only\n");
 			DBG_LOG("blk_size byte\n\tfdl2 stage only, max is 65535\n");
 			DBG_LOG("nand_id id\n");
 			DBG_LOG("disable_transcode\n");

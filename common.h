@@ -162,7 +162,7 @@ void print_string(FILE* f, const void* src, size_t n);
 #if USE_LIBUSB
 void find_endpoints(libusb_device_handle* dev_handle, int result[2]);
 #else
-BOOL ChangeMode(spdio_t* io);
+BOOL ChangeMode(int ms);
 #endif
 
 spdio_t* spdio_init(int flags);
